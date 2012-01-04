@@ -22,9 +22,13 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 import BaseHTTPServer
 import logging
 import threading
-import signal
 import smtpd
 import asyncore
+import re
+
+# Poor man's database
+db_lock = threading.Lock()
+db = []
 
 
 class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -33,12 +37,38 @@ class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.log.debug('self.path: ' + self.path)
-        # Send header.
+        if self.path == '/':
+            self.do_listing()
+        elif re.match('/[0-9]+', self.path):
+            self.do_show_email(int(self.path[1:]))
+        else:
+            self.do_404()
+
+    def do_listing(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
         # Send content.
-        self.wfile.write('You asked ' + self.path)
+        self.wfile.write('<html><body>')
+        self.wfile.write('listing:<ol>')
+        global db_lock, db
+        db_lock.acquire()
+        for i, entry in enumerate(db):
+            self.wfile.write('<li>{0!r}</li>'.format(entry))
+        db_lock.release()
+        self.wfile.write('</ol>')
+        self.wfile.write('</body></html>')
+
+    def do_show_email(self, id):
+        pass
+
+    def do_404(self):
+        # Send header.
+        self.send_response(404)
+        self.end_headers()
+        # Send content.
+        self.wfile.write('<htm><body>page not found: {0!r}</body></html>'.format(self.path))
+
 
 
 class HttpServerThread(threading.Thread):
@@ -70,6 +100,10 @@ class SmtpServer(smtpd.SMTPServer):
         self.log.debug('Message addressed from {0}'.format(mailfrom))
         self.log.debug('Message addressed to {0!r}'.format(rcpttos))
         self.log.debug('Message body (first part): {0}'.format(data[:1000]))
+        global db_lock, db
+        db_lock.acquire()
+        db.append((peer, mailfrom, rcpttos, data))
+        db_lock.release()
 
 
 class SmtpServerThread(threading.Thread):
@@ -106,7 +140,7 @@ if __name__ == '__main__':
     # with threading and KeyboardInterrupts. Calling join with a timeout
     # (in a loop) seems to do it better
     while httpd_thread.isAlive() or smtpd_thread.isAlive():
-        logging.debug('Still alive.')
+        logging.debug('Threads alive? HTTPD: {0}, SMTPD: {0}.'.format(httpd_thread.isAlive(), smtpd_thread.isAlive()))
         httpd_thread.join(10)
         smtpd_thread.join(10)
 
