@@ -27,11 +27,15 @@ import asyncore
 import re
 
 # Poor man's database
+# TODO use a real database, like sqlite?
 db_lock = threading.Lock()
 db = []
 
 
 class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+    '''
+    Simple handler for HTTP requests.
+    '''
 
     log = logging.getLogger('emailboard.requesthandler')
 
@@ -70,8 +74,10 @@ class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.wfile.write('<htm><body>page not found: {0!r}</body></html>'.format(self.path))
 
 
-
 class HttpServerThread(threading.Thread):
+    '''
+    HTTP server thread.
+    '''
 
     log = logging.getLogger('emailboard.httpdthread')
 
@@ -92,6 +98,9 @@ class HttpServerThread(threading.Thread):
 
 
 class SmtpServer(smtpd.SMTPServer):
+    '''
+    Handler for SMTP requests.
+    '''
 
     log = logging.getLogger('emailboard.smtpd')
 
@@ -107,6 +116,9 @@ class SmtpServer(smtpd.SMTPServer):
 
 
 class SmtpServerThread(threading.Thread):
+    '''
+    SMTP server thread.
+    '''
 
     log = logging.getLogger('emailboard.smtpdthread')
 
@@ -117,11 +129,15 @@ class SmtpServerThread(threading.Thread):
 
     def run(self):
         self.log.debug('Setting up SMTP server on {0}'.format(self.server_address))
-        server = SmtpServer(self.server_address, None)
+        self._server = SmtpServer(self.server_address, None)
         # Start asyncore loop
         asyncore.loop()
 
+
 def main():
+    # TODO: provide command line option to set server name and port numbers
+    # TODO: provide command line option to set logging level
+
     log = logging.getLogger('emailboard')
 
     # HTTP server
@@ -147,7 +163,7 @@ def main():
             log.error('HTTP server thread died unexpectedly. There must be something wrong.')
         if not smtpd_thread.isAlive():
             log.error('SMTP server thread died unexpectedly. There must be something wrong.')
-    except KeyboardInterrupt, e:
+    except KeyboardInterrupt:
         log.info('Received keyboard interrupt: closing down.')
         return
 
