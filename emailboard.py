@@ -58,13 +58,25 @@ class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         global db_lock, db
         db_lock.acquire()
         for i, entry in enumerate(db):
-            self.wfile.write('<li>{0!r}</li>'.format(entry))
+            (peer, mailfrom, rcpttos, data) = entry
+            self.wfile.write('<li><a href="/{i}">{sender}: title, date</a></li>'.format(i=i, sender=mailfrom))
         db_lock.release()
         self.wfile.write('</ol>')
         self.wfile.write('</body></html>')
 
     def do_show_email(self, id):
-        pass
+        # Get entry.
+        global db_lock, db
+        db_lock.acquire()
+        (peer, mailfrom, rcpttos, data) = db[id]
+        db_lock.release()
+        # Render.
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(data)
+
+
 
     def do_404(self):
         # Send header.
@@ -109,6 +121,8 @@ class SmtpServer(smtpd.SMTPServer):
         self.log.debug('Message addressed from {0}'.format(mailfrom))
         self.log.debug('Message addressed to {0!r}'.format(rcpttos))
         self.log.debug('Message body (first part): {0}'.format(data[:1000]))
+        # TODO: extract and store title
+        # TODO: store receive date+time
         global db_lock, db
         db_lock.acquire()
         db.append((peer, mailfrom, rcpttos, data))
