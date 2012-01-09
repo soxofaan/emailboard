@@ -121,27 +121,37 @@ class SmtpServerThread(threading.Thread):
         # Start asyncore loop
         asyncore.loop()
 
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
+def main():
+    log = logging.getLogger('emailboard')
 
     # HTTP server
-    logging.debug('Starting HTTP server thread')
+    log.info('Starting HTTP server thread')
     httpd_thread = HttpServerThread(server_address=('localhost', 8989))
     httpd_thread.start()
 
     # SMTP server
-    logging.debug('Starting SMTP server thread')
+    log.info('Starting SMTP server thread')
     smtpd_thread = SmtpServerThread(server_address=('localhost', 9898))
     smtpd_thread.start()
 
-    logging.debug('Waiting for threads to stop.')
+    log.info('Monitoring the working threads.')
     # Just calling httpd_thread.join() does not play well
     # with threading and KeyboardInterrupts. Calling join with a timeout
-    # (in a loop) seems to do it better
-    while httpd_thread.isAlive() or smtpd_thread.isAlive():
-        logging.debug('Threads alive? HTTPD: {0}, SMTPD: {0}.'.format(httpd_thread.isAlive(), smtpd_thread.isAlive()))
-        httpd_thread.join(10)
-        smtpd_thread.join(10)
+    # (in a loop) seems to do it better.
+    try:
+        while httpd_thread.isAlive() and smtpd_thread.isAlive():
+            log.debug('Threads alive? HTTPD: {0}, SMTPD: {0}.'.format(httpd_thread.isAlive(), smtpd_thread.isAlive()))
+            httpd_thread.join(10)
+            smtpd_thread.join(10)
+        if not httpd_thread.isAlive():
+            log.error('HTTP server thread died unexpectedly. There must be something wrong.')
+        if not smtpd_thread.isAlive():
+            log.error('SMTP server thread died unexpectedly. There must be something wrong.')
+    except KeyboardInterrupt, e:
+        log.info('Received keyboard interrupt: closing down.')
+        return
 
-    logging.debug('That\'s all folks')
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
+    main()
