@@ -34,29 +34,23 @@ import email
 
 
 
-# Emailboard database file
-# TODO: provide config value to set this file?
-db_file = 'emailboard.sqlite'
+
+# Threading lock for db creation.
+_get_database_connection_lock = threading.Lock()
 
 
-class EmailDatabase(object):
-
+def get_database_connection(db_file_name):
+    '''
+    Get a connection to the SQLite database file
+    and create it when not available yet.
+    '''
     log = logging.getLogger('emailboard.db')
+    log.debug('Getting database connection from file ' + db_file_name)
 
-    def __init__(self, db_file_name):
-        logging.debug('EmailDatabase from file ' + db_file_name)
-
-        if not os.path.exists(db_file_name):
-            EmailDatabase._create_database(db_file_name)
-
-        self._conn = sqlite3.connect(db_file_name)
-
-    @classmethod
-    def _create_database(cls, db_file_name):
-        '''
-        Create the database and tables in given sqlite file.
-        '''
-        cls.log.debug('Creating database in file "{0}".'.format(db_file_name))
+    global _get_database_connection_lock
+    _get_database_connection_lock.acquire()
+    if not os.path.exists(db_file_name):
+        log.debug('Creating database in file "{0}".'.format(db_file_name))
         conn = sqlite3.connect(db_file_name)
         c = conn.cursor()
         # TODO: check sender field size
@@ -74,26 +68,16 @@ class EmailDatabase(object):
             )
         ''')
         conn.commit()
+    _get_database_connection_lock.release()
 
-    def get_emails(self):
-        c = self._conn.cursor()
-        c.execute('SELECT id, timestamp, sender, receivers, subject, data FROM emails')
-        return c.fetchall()
+    connection = sqlite3.connect(db_file_name)
+    return connection
 
-    def get_email(self, id):
-        c = self._conn.cursor()
-        c.execute('SELECT id, timestamp, sender, receivers, subject, data FROM emails WHERE id=?', (id,))
-        return c.fetchone()
 
-    def store_email(self, sender, receivers, data):
-        c = self._conn.cursor()
-        timestamp = int(time.time())
-        msg = email.message_from_string(data)
-        subject = msg['Subject']
-        c.execute('''
-            INSERT INTO emails (timestamp, sender, receivers, subject, data)
-            VALUES (?,?,?,?,?)''', (timestamp, sender, ','.join(receivers), subject, data))
-        self._conn.commit()
+
+
+
+
 
 
 class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -114,16 +98,15 @@ class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def do_listing(self):
         # TODO: paging
-
-        global db_file
-        edb = EmailDatabase(db_file)
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
         # Send content.
         self.wfile.write('<html><body>')
         self.wfile.write('listing:<ol>')
-        for (id, timestamp, sender, receivers, subject, data) in edb.get_emails():
+        c = self.server.db_connection.cursor()
+        c.execute('SELECT id, timestamp, sender, receivers, subject, data FROM emails')
+        for (id, timestamp, sender, receivers, subject, data) in c.fetchall():
             self.wfile.write('<li><a href="/{i}">{sender}: {subject}, {date}</a></li>'.format(i=id, sender=sender, subject=subject, date=time.ctime(timestamp)))
         self.wfile.write('</ol>')
         self.wfile.write('</body></html>')
@@ -131,9 +114,9 @@ class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     def do_show_email(self, id):
         # TODO: option to switch between raw/text/html view
         # Get entry.
-        global db_file
-        edb = EmailDatabase(db_file)
-        (id, timestamp, sender, receivers, subject, data) = edb.get_email(id)
+        c = self.server.db_connection.cursor()
+        c.execute('SELECT id, timestamp, sender, receivers, subject, data FROM emails WHERE id=?', (id,))
+        (id, timestamp, sender, receivers, subject, data) = c.fetchone()
         # Render.
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
@@ -155,10 +138,11 @@ class HttpServerThread(threading.Thread):
 
     log = logging.getLogger('emailboard.httpdthread')
 
-    def __init__(self, server_address):
+    def __init__(self, server_address, db_file):
         threading.Thread.__init__(self)
         self.daemon = True
         self.server_address = server_address
+        self._db_file = db_file
 
     def run(self):
         # Create HTTP server.
@@ -166,6 +150,8 @@ class HttpServerThread(threading.Thread):
             server_address=self.server_address,
             RequestHandlerClass=HttpRequestHandler
         )
+        # Store a reusable database connection, to be used by request handler.
+        httpd.db_connection = get_database_connection(self._db_file)
         # Start it
         self.log.debug('Starting server ({0!r}'.format(self.server_address))
         httpd.serve_forever()
@@ -178,14 +164,25 @@ class SmtpServer(smtpd.SMTPServer):
 
     log = logging.getLogger('emailboard.smtpd')
 
+    def __init__(self, localaddr, db_file):
+        smtpd.SMTPServer.__init__(self, localaddr, remoteaddr=None)
+        # Reusable database connection.
+        self.db_connection = get_database_connection(db_file)
+
     def process_message(self, peer, mailfrom, rcpttos, data):
         self.log.debug('Received message from peer {0}'.format(peer))
         self.log.debug('Message addressed from {0}'.format(mailfrom))
         self.log.debug('Message addressed to {0!r}'.format(rcpttos))
         self.log.debug('Message body (first part): {0}'.format(data[:1000]))
-        global db_file
-        edb = EmailDatabase(db_file)
-        edb.store_email(sender=mailfrom, receivers=rcpttos, data=data)
+        # Store email.
+        c = self.db_connection.cursor()
+        timestamp = int(time.time())
+        msg = email.message_from_string(data)
+        subject = msg['Subject']
+        c.execute('''
+            INSERT INTO emails (timestamp, sender, receivers, subject, data)
+            VALUES (?,?,?,?,?)''', (timestamp, mailfrom, ','.join(rcpttos), subject, data))
+        self.db_connection.commit()
 
 
 class SmtpServerThread(threading.Thread):
@@ -195,14 +192,15 @@ class SmtpServerThread(threading.Thread):
 
     log = logging.getLogger('emailboard.smtpdthread')
 
-    def __init__(self, server_address):
+    def __init__(self, server_address, db_file):
         threading.Thread.__init__(self)
         self.daemon = True
         self.server_address = server_address
+        self._db_file = db_file
 
     def run(self):
         self.log.debug('Setting up SMTP server on {0}'.format(self.server_address))
-        self._server = SmtpServer(self.server_address, None)
+        self._server = SmtpServer(self.server_address, self._db_file)
         # Start asyncore loop
         asyncore.loop()
 
@@ -213,14 +211,18 @@ def main():
 
     log = logging.getLogger('emailboard')
 
+    # Emailboard database file
+    # TODO: provide config value to set this file?
+    db_file = 'emailboard.sqlite'
+
     # HTTP server
     log.info('Starting HTTP server thread')
-    httpd_thread = HttpServerThread(server_address=('localhost', 8989))
+    httpd_thread = HttpServerThread(server_address=('localhost', 8989), db_file=db_file)
     httpd_thread.start()
 
     # SMTP server
     log.info('Starting SMTP server thread')
-    smtpd_thread = SmtpServerThread(server_address=('localhost', 9898))
+    smtpd_thread = SmtpServerThread(server_address=('localhost', 9898), db_file=db_file)
     smtpd_thread.start()
 
     log.info('Monitoring the working threads.')
