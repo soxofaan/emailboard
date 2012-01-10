@@ -18,18 +18,82 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 '''
 
+# TODO: prune old emails automatically?
 
+import os
 import BaseHTTPServer
 import logging
 import threading
 import smtpd
 import asyncore
 import re
+import sqlite3
+import time
+import datetime
+import email
 
-# Poor man's database
-# TODO use a real database, like sqlite?
-db_lock = threading.Lock()
-db = []
+
+
+# Emailboard database file
+# TODO: provide config value to set this file?
+db_file = 'emailboard.sqlite'
+
+
+class EmailDatabase(object):
+
+    log = logging.getLogger('emailboard.db')
+
+    def __init__(self, db_file_name):
+        logging.debug('EmailDatabase from file ' + db_file_name)
+
+        if not os.path.exists(db_file_name):
+            EmailDatabase._create_database(db_file_name)
+
+        self._conn = sqlite3.connect(db_file_name)
+
+    @classmethod
+    def _create_database(cls, db_file_name):
+        '''
+        Create the database and tables in given sqlite file.
+        '''
+        cls.log.debug('Creating database in file "{0}".'.format(db_file_name))
+        conn = sqlite3.connect(db_file_name)
+        c = conn.cursor()
+        # TODO: check sender field size
+        # TODO: check receiver field size
+        # TODO: index on receivers?
+        # TODO: index on subject?
+        c.execute('''
+            CREATE TABLE emails (
+                id INTEGER PRIMARY KEY,
+                timestamp INTEGER UNSIGNED,
+                sender VARCHAR(64),
+                receivers VARCHAR(512),
+                subject VARCHAR(256),
+                data TEXT
+            )
+        ''')
+        conn.commit()
+
+    def get_emails(self):
+        c = self._conn.cursor()
+        c.execute('SELECT id, timestamp, sender, receivers, subject, data FROM emails')
+        return c.fetchall()
+
+    def get_email(self, id):
+        c = self._conn.cursor()
+        c.execute('SELECT id, timestamp, sender, receivers, subject, data FROM emails WHERE id=?', (id,))
+        return c.fetchone()
+
+    def store_email(self, sender, receivers, data):
+        c = self._conn.cursor()
+        timestamp = int(time.time())
+        msg = email.message_from_string(data)
+        subject = msg['Subject']
+        c.execute('''
+            INSERT INTO emails (timestamp, sender, receivers, subject, data)
+            VALUES (?,?,?,?,?)''', (timestamp, sender, ','.join(receivers), subject, data))
+        self._conn.commit()
 
 
 class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -49,34 +113,32 @@ class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.do_404()
 
     def do_listing(self):
+        # TODO: paging
+
+        global db_file
+        edb = EmailDatabase(db_file)
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
         # Send content.
         self.wfile.write('<html><body>')
         self.wfile.write('listing:<ol>')
-        global db_lock, db
-        db_lock.acquire()
-        for i, entry in enumerate(db):
-            (peer, mailfrom, rcpttos, data) = entry
-            self.wfile.write('<li><a href="/{i}">{sender}: title, date</a></li>'.format(i=i, sender=mailfrom))
-        db_lock.release()
+        for (id, timestamp, sender, receivers, subject, data) in edb.get_emails():
+            self.wfile.write('<li><a href="/{i}">{sender}: {subject}, {date}</a></li>'.format(i=id, sender=sender, subject=subject, date=time.ctime(timestamp)))
         self.wfile.write('</ol>')
         self.wfile.write('</body></html>')
 
     def do_show_email(self, id):
+        # TODO: option to switch between raw/text/html view
         # Get entry.
-        global db_lock, db
-        db_lock.acquire()
-        (peer, mailfrom, rcpttos, data) = db[id]
-        db_lock.release()
+        global db_file
+        edb = EmailDatabase(db_file)
+        (id, timestamp, sender, receivers, subject, data) = edb.get_email(id)
         # Render.
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
         self.wfile.write(data)
-
-
 
     def do_404(self):
         # Send header.
@@ -121,12 +183,9 @@ class SmtpServer(smtpd.SMTPServer):
         self.log.debug('Message addressed from {0}'.format(mailfrom))
         self.log.debug('Message addressed to {0!r}'.format(rcpttos))
         self.log.debug('Message body (first part): {0}'.format(data[:1000]))
-        # TODO: extract and store title
-        # TODO: store receive date+time
-        global db_lock, db
-        db_lock.acquire()
-        db.append((peer, mailfrom, rcpttos, data))
-        db_lock.release()
+        global db_file
+        edb = EmailDatabase(db_file)
+        edb.store_email(sender=mailfrom, receivers=rcpttos, data=data)
 
 
 class SmtpServerThread(threading.Thread):
