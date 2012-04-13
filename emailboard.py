@@ -21,7 +21,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 # TODO: prune old emails automatically?
 
 import os
-import BaseHTTPServer
 import logging
 import threading
 import smtpd
@@ -31,6 +30,7 @@ import sqlite3
 import time
 import datetime
 import email
+import wsgiref.simple_server
 
 
 
@@ -74,88 +74,126 @@ def get_database_connection(db_file_name):
     return connection
 
 
+#############################################################################
+# Web app implementation and serving
+
+class NotFoundException(Exception):
+    '''Exception for page not found situations.'''
+    pass
 
 
+class RedirectException(Exception):
+    '''Exception to raise for HTTP redirects.'''
+    def __init__(self, target):
+        Exception.__init__(self)
+        self.target = target
 
 
+class WebAppResponse(object):
+    '''Simple wrapper for web app responses, with some defaults.'''
+    def __init__(self, content, content_type='text/html', status='200 OK'):
+        self.content = str(content)
+        self.headers = [('Content-type', content_type)]
+        self.status = status
 
 
-class HttpRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+class WebApp:
     '''
-    Simple handler for HTTP requests.
+    ReviewBoard WSGI web app.
+
+    Implemented as WSGI app with standard lib functionality (no external web frameworks).
     '''
 
-    log = logging.getLogger('emailboard.requesthandler')
+    log = logging.getLogger('emailboard.webapp')
 
-    def do_GET(self):
-        self.log.debug('self.path: ' + self.path)
-        if self.path == '/':
-            self.do_listing()
-        elif re.match('/[0-9]+', self.path):
-            self.do_show_email(int(self.path[1:]))
-        else:
-            self.do_404()
+    def __init__(self, db_file):
+        # Store reusable DB connection.
+        self.db_connection = get_database_connection(db_file)
+        # Set up Routing: list of tuples (path_pattern, method, callback)
+        self._routing = [
+            ('^/$', 'GET', self.get_listing),
+            ('^/(?P<id>[0-9]+)/?$', 'GET', self.get_email),
+        ]
 
-    def do_listing(self):
-        # TODO: paging
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
+    def __call__(self, environ, start_response):
+        '''WSGI callable implementation.'''
+
+        request_method = environ['REQUEST_METHOD']
+        path_info = environ['PATH_INFO']
+        self.log.debug('Request for path "%s" (%s)' % (path_info, request_method))
+
+        try:
+            for path_pattern, method, callback in self._routing:
+                if method != request_method:
+                    continue
+                m = re.match(path_pattern, path_info)
+                if m == None:
+                    continue
+                # Extract arguments from parsed path as a dictionary.
+                arg_dict = m.groupdict()
+                self.log.debug('Dispatching request to callback "{callback}" with argument dict {arg_dict}'.format(callback=callback, arg_dict=arg_dict))
+                response = callback(environ, **arg_dict)
+                break
+            else:
+                raise NotFoundException()
+        except NotFoundException:
+            response = WebAppResponse('Not found: %s' % environ['PATH_INFO'], content_type='text/plain', status='404 Not Found')
+        except RedirectException, e:
+            response = WebAppResponse('', status='301 Moved Permanently')
+            response.headers.append(('Location', e.location))
+        except Exception, e:
+            self.log.error('Exception occured: ' + repr(e))
+            response = WebAppResponse('Internal server error', content_type='text/plain', status='500 Internal Server Error')
+
+        # WSGI API: call start_response and return content.
+        start_response(response.status, response.headers)
+        return [response.content]
+
+    def get_listing(self, environ):
         # Send content.
-        self.wfile.write('<html><body>')
-        self.wfile.write('listing:<ol>')
-        c = self.server.db_connection.cursor()
+        content = '<html><body>'
+        content += 'listing:<ol>'
+        c = self.db_connection.cursor()
         c.execute('SELECT id, timestamp, sender, receivers, subject, data FROM emails')
         for (id, timestamp, sender, receivers, subject, data) in c.fetchall():
-            self.wfile.write('<li><a href="/{i}">{sender}: {subject}, {date}</a></li>'.format(i=id, sender=sender, subject=subject, date=time.ctime(timestamp)))
-        self.wfile.write('</ol>')
-        self.wfile.write('</body></html>')
+            content += '<li><a href="/{i}">{sender}: {subject}, {date}</a></li>'.format(i=id, sender=sender, subject=subject, date=time.ctime(timestamp))
+        content += '</ol>'
+        content += '</body></html>'
+        return WebAppResponse(content)
 
-    def do_show_email(self, id):
+    def get_email(self, environ, id):
+        id = int(id)
         # TODO: option to switch between raw/text/html view
         # Get entry.
-        c = self.server.db_connection.cursor()
+        c = self.db_connection.cursor()
         c.execute('SELECT id, timestamp, sender, receivers, subject, data FROM emails WHERE id=?', (id,))
         (id, timestamp, sender, receivers, subject, data) = c.fetchone()
         # Render.
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(data)
-
-    def do_404(self):
-        # Send header.
-        self.send_response(404)
-        self.end_headers()
-        # Send content.
-        self.wfile.write('<htm><body>page not found: {0!r}</body></html>'.format(self.path))
+        return WebAppResponse(content=data, content_type='text/plain')
 
 
-class HttpServerThread(threading.Thread):
+class WebAppServerThread(threading.Thread):
     '''
-    HTTP server thread.
+    Web app (HTTP) server thread.
     '''
 
     log = logging.getLogger('emailboard.httpdthread')
 
-    def __init__(self, server_address, db_file):
+    def __init__(self, host, port, db_file):
         threading.Thread.__init__(self)
         self.daemon = True
-        self.server_address = server_address
+        self.server_host = host
+        self.server_port = port
         self._db_file = db_file
 
     def run(self):
-        # Create HTTP server.
-        httpd = BaseHTTPServer.HTTPServer(
-            server_address=self.server_address,
-            RequestHandlerClass=HttpRequestHandler
-        )
-        # Store a reusable database connection, to be used by request handler.
-        httpd.db_connection = get_database_connection(self._db_file)
-        # Start it
-        self.log.debug('Starting server ({0!r}'.format(self.server_address))
+        httpd = wsgiref.simple_server.make_server(self.server_host, self.server_port, WebApp(self._db_file))
+        self.log.debug('Starting server (%s:%d)' % (self.server_host, self.server_port))
         httpd.serve_forever()
 
+
+#############################################################################
+# SMTP server
 
 class SmtpServer(smtpd.SMTPServer):
     '''
@@ -216,8 +254,8 @@ def main():
     db_file = 'emailboard.sqlite'
 
     # HTTP server
-    log.info('Starting HTTP server thread')
-    httpd_thread = HttpServerThread(server_address=('localhost', 8989), db_file=db_file)
+    log.info('Starting web app server thread')
+    httpd_thread = WebAppServerThread('localhost', 8989, db_file=db_file)
     httpd_thread.start()
 
     # SMTP server
